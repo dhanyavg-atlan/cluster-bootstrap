@@ -6,17 +6,31 @@ ServiceAccount + install **Flux + Flagger**, then register the cluster into Devt
 Tested end-to-end on `poc3` (us-central1-a): all 6 Flux controllers + Flagger came up,
 and the `cd_user_token` output feeds `register.sh`.
 
-## The Job — 2 tasks
+## The Job — ONE task (Execute custom task → Container Image)
 
-**Task 1 — Container Image Task** (image built from `Dockerfile`):
-```bash
-tofu init -backend-config="prefix=clusters/${PLANE}" \
-  && tofu apply -auto-approve -var="name=${PLANE}"
-```
+A single container-image task does everything (create cluster → install Flux/Flagger
+→ register into Devtron). Use the public OpenTofu image directly — no custom Dockerfile.
 
-**Task 2 — Shell Task:**
-```bash
-./register.sh
+Devtron UI fields:
+
+| Field | Value |
+|---|---|
+| Container image | `ghcr.io/opentofu/opentofu:1.12.1` |
+| Mount custom code | **Yes** → "Mount above code at" `/run.sh` (script below) |
+| Command | `sh` |
+| Args | `/run.sh` |
+| Mount code to container | **Yes** → `/work` (the git repo) |
+| Input variables | `PLANE`, `DEVTRON_HOST`, `DEVTRON_API_TOKEN` (sensitive) |
+
+Script (paste into "Mount custom code"):
+```sh
+#!/bin/sh
+set -e
+cd /work
+apk add --no-cache curl
+tofu init -backend-config="prefix=clusters/$PLANE"
+tofu apply -auto-approve -var="name=$PLANE"
+sh register.sh
 ```
 
 Runtime parameter: `PLANE` (e.g. `poc3`). Triggered per plane via UI or API.
@@ -26,7 +40,7 @@ Runtime parameter: `PLANE` (e.g. `poc3`). Triggered per plane via UI or API.
 | | Item | How |
 |---|---|---|
 | **A** | Remote state | `backend "gcs"` → bucket `dev-infra-test-497417-tofu-state` (versioned). Per-plane state via `-backend-config="prefix=clusters/$PLANE"` at init. |
-| **B** | Runner image | `Dockerfile` = OpenTofu 1.12 + curl + bash. No gcloud/helm CLI needed. |
+| **B** | Runner image | Use public `ghcr.io/opentofu/opentofu:1.12.1` directly (script does `apk add curl`). The `Dockerfile` is optional — only if you want a pinned private image. |
 | **C** | GCP auth | Workload Identity — see below. |
 | **D** | Network | `authorized_cidrs` defaults to Devtron's egress `34.56.214.245/32` (poc-2 NAT). Confirm this is your management cluster's egress. |
 
