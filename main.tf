@@ -22,9 +22,8 @@ terraform {
 }
 
 variable "project" { default = "dev-infra-test-497417" }
-variable "zone"    { default = "us-central1-a" }
-variable "region"  { default = "us-central1" } # for the Cloud Router + NAT (private-node egress)
-variable "name"    { default = "poc3" } # pass -var="name=$PLANE" per plane
+variable "zone" { default = "us-central1-a" }
+variable "name" { default = "poc3" } # pass -var="name=$PLANE" per plane
 
 # (D) INTERNAL CIDRs allowed to reach the PRIVATE control-plane endpoint. The endpoint has no
 # public IP, so these must be in-VPC ranges (Devtron's node/pod CIDR on poc-2). Default covers
@@ -95,21 +94,9 @@ resource "google_container_node_pool" "default" {
   }
 }
 
-# ---------- Cloud NAT — egress for private nodes (no public IPs) ----------
-# Without this, nodes can't pull images or let Flux fetch charts from public repos.
-resource "google_compute_router" "this" {
-  name    = "${var.name}-router"
-  region  = var.region
-  network = "default"
-}
-
-resource "google_compute_router_nat" "this" {
-  name                               = "${var.name}-nat"
-  router                             = google_compute_router.this.name
-  region                             = var.region
-  nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
-}
+# Node egress (pulling images / Flux charts) is already provided by the existing
+# region-wide Cloud NAT (teleport-poc-nat, ALL_SUBNETWORKS_ALL_IP_RANGES on us-central1/default),
+# which covers poc3's subnet too. A second NAT here would conflict, so none is created.
 
 # ---------- providers pointed at the new cluster ----------
 data "google_client_config" "current" {}
@@ -169,7 +156,7 @@ resource "helm_release" "flux" {
   namespace        = "flux-system"
   create_namespace = true
   timeout          = 600
-  depends_on       = [google_container_node_pool.default, google_compute_router_nat.this]
+  depends_on       = [google_container_node_pool.default]
 }
 
 resource "helm_release" "flagger" {
