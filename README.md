@@ -1,39 +1,87 @@
 # cluster-bootstrap
 
-One parameterized flow, run as a **Devtron Job**: create a GKE cluster + `cd-user`
-ServiceAccount + install **Flux + Flagger**, then register the cluster into Devtron.
+Onboard a new tenant/plane cluster, run as **one Devtron Job with three tasks**:
+**provision → register → deploy**. `PLANE` (the cluster/tenant name) is the single
+runtime input — set it once at trigger, and the whole flow is repeatable for any plane.
 
-Tested end-to-end on `poc3` (us-central1-a): all 6 Flux controllers + Flagger came up,
-and the `cd_user_token` output feeds `register.sh`.
+Tested end-to-end on `poc3` (us-central1-a): all 6 Flux controllers + Flagger came up.
 
-## The Job — ONE task (Execute custom task → Container Image)
+## Onboarding plan — 3 tasks
 
-A single container-image task does everything (create cluster → install Flux/Flagger
-→ register into Devtron). Use the public OpenTofu image directly — no custom Dockerfile.
+Each task is an *Execute custom task → Container Image*. Data flows between them via
+Devtron **output → input variables**.
 
-Devtron UI fields:
+### Task 1 — `provision-infra` (Terraform)
+Creates the cluster and its controllers.
 
 | Field | Value |
 |---|---|
-| Container image | `ghcr.io/opentofu/opentofu:1.12.1` |
-| Mount custom code | **Yes** → "Mount above code at" `/run.sh` (script below) |
-| Command | `sh` |
-| Args | `/run.sh` |
+| Image | `ghcr.io/opentofu/opentofu:1.12.1` |
+| Mount custom code → at | **Yes** → `/run.sh` |
+| Command / Args | `sh` / `/run.sh` |
 | Mount code to container | **Yes** → `/work` (the git repo) |
-| Input variables | `PLANE`, `DEVTRON_HOST`, `DEVTRON_API_TOKEN` (sensitive) |
+| Input variables | `PLANE` |
+| **Output variables** | `CLUSTER_ENDPOINT`, `CD_USER_TOKEN` |
 
-Script (paste into "Mount custom code"):
 ```sh
 #!/bin/sh
 set -e
 cd /work
-apk add --no-cache curl
 tofu init -backend-config="prefix=clusters/$PLANE"
 tofu apply -auto-approve -var="name=$PLANE"
-sh register.sh
+export CLUSTER_ENDPOINT="$(tofu output -raw cluster_endpoint)"
+export CD_USER_TOKEN="$(tofu output -raw cd_user_token)"
+```
+Creates: GKE cluster + `cd-user` SA (cluster-admin) + **Flux** + **Flagger**.
+
+### Task 2 — `register-cluster` (Devtron API)
+Tells Devtron about the new cluster (for access management + observability). No repo needed.
+
+| Field | Value |
+|---|---|
+| Image | `alpine:3.20` |
+| Mount custom code → at | **Yes** → `/run.sh` |
+| Command / Args | `sh` / `/run.sh` |
+| Mount code to container | **No** |
+| Input variables | `CLUSTER_ENDPOINT` + `CD_USER_TOKEN` ← *from Task 1 output*; `DEVTRON_HOST`, `DEVTRON_API_TOKEN`, `PLANE` |
+
+```sh
+#!/bin/sh
+set -e
+apk add --no-cache curl
+curl -sS -X POST "https://$DEVTRON_HOST/orchestrator/cluster" \
+  -H "token: $DEVTRON_API_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"cluster_name\":\"$PLANE\",\"server_url\":\"$CLUSTER_ENDPOINT\",\"config\":{\"bearer_token\":\"$CD_USER_TOKEN\"},\"insecure-skip-tls-verify\":true}"
 ```
 
-Runtime parameter: `PLANE` (e.g. `poc3`). Triggered per plane via UI or API.
+### Task 3 — `deploy-workloads`  *(expectation — not yet built)*
+
+**Goal:** get *this plane's workloads running* on the freshly-onboarded cluster, with
+**per-tenant value overrides**. After Task 1 (cluster + Flux exist) and Task 2 (Devtron
+sees it), Task 3 is what actually puts the plane's services on the cluster.
+
+**What it must do:**
+1. **Override the deployment values** for this specific plane/tenant — i.e. the per-plane
+   Helm values + the `enable` flags that select *which* charts this plane runs
+   (management-plane charts vs identity-plane charts, etc.).
+2. **Apply the resources to the cluster** so those workloads come up.
+
+**Mechanism — open design decision (the thing we're working out):**
+- **Preferred (keeps Devtron out of CD):** Task 3 seeds the *in-cluster Flux's* desired
+  state — apply the plane's `GitRepository` / `Kustomization` / `HelmRelease` (or the
+  enable-flags + per-plane override values), then Flux pulls that plane's charts from OCI
+  and reconciles them. Delivery stays with Flux; Devtron only seeds config.
+- **Alternative under evaluation:** call the **Devtron API** to create a deployment/workflow
+  block that overrides the values and applies them to the registered cluster directly.
+
+**Inputs it will need:** `PLANE`, the cluster endpoint/credentials (from Task 1 / the
+registration), the chart name + version, and the per-plane override values.
+
+**Status:** to be designed and validated next — this README will be updated once the
+mechanism is chosen.
+
+> Note: Tasks 1 & 2 are proven; the output→input variable handoff between them is wired.
+> Task 3 is the remaining piece to make onboarding end at "workloads running."
 
 ## What's already resolved
 
@@ -66,8 +114,11 @@ gcloud iam service-accounts add-iam-policy-binding $GSA \
 
 ## Secrets / env on the Job
 
-- `DEVTRON_HOST`, `DEVTRON_API_TOKEN` (secret) — for `register.sh`.
-- `PLANE` — runtime parameter.
+- `DEVTRON_HOST`, `DEVTRON_API_TOKEN` — used by Task 2 (register). Treat the token as a
+  secret; rotate it regularly. (This Devtron build has no "sensitive" toggle on task
+  variables, so the value is stored in plaintext on the task — rotate accordingly.)
+- `PLANE` — the single runtime parameter (cluster/tenant name), e.g. `poc3`.
+- `register.sh` is kept for **local** testing only; the Devtron flow inlines the curl in Task 2.
 
 ## Run locally (test)
 
