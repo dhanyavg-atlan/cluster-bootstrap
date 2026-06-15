@@ -177,6 +177,12 @@ output "cluster_endpoint" {
   value = "https://${google_container_cluster.this.endpoint}"
 }
 
+# Base64 cluster CA — passed to Devtron as cert_auth_data so it can verify the
+# private master's TLS cert (the private endpoint has no public CA chain).
+output "cluster_ca" {
+  value = google_container_cluster.this.master_auth[0].cluster_ca_certificate
+}
+
 output "cd_user_token" {
   value     = kubernetes_secret.cd_user_token.data["token"]
   sensitive = true
