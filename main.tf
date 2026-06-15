@@ -1,6 +1,11 @@
-# Plane bootstrap — create a GKE cluster + cd-user SA + install Flux/Flagger, in one apply.
+# Plane bootstrap — create a private GKE cluster + cd-user SA + install Flux/Flagger, in one apply.
 # Designed to run as a Devtron Job (Task 1). State lives in GCS (per-plane prefix).
 # Tested end-to-end on poc3 (us-central1-a).
+#
+# PRIVATE cluster: nodes have internal IPs only (egress via Cloud NAT) and the control-plane
+# endpoint is private — reachable only from inside the VPC. Devtron (same project/VPC) reaches
+# the API over the private endpoint; the Terraform kubernetes/helm providers do too, since the
+# Job pod runs in that VPC. There is NO public endpoint, so the API allowlist is an INTERNAL CIDR.
 
 terraform {
   required_providers {
@@ -18,13 +23,22 @@ terraform {
 
 variable "project" { default = "dev-infra-test-497417" }
 variable "zone"    { default = "us-central1-a" }
+variable "region"  { default = "us-central1" } # for the Cloud Router + NAT (private-node egress)
 variable "name"    { default = "poc3" } # pass -var="name=$PLANE" per plane
 
-# (D) CIDRs allowed to reach the cluster API server. Default = Devtron's egress IP
-# (poc-2 NAT) so the Job can reach it. For a local test, append your laptop IP via -var.
+# (D) INTERNAL CIDRs allowed to reach the PRIVATE control-plane endpoint. The endpoint has no
+# public IP, so these must be in-VPC ranges (Devtron's node/pod CIDR on poc-2). Default covers
+# the shared internal range; scope this down to Devtron's exact source CIDR for prod.
 variable "authorized_cidrs" {
   type    = list(string)
-  default = ["34.56.214.245/32"]
+  default = ["10.0.0.0/8"]
+}
+
+# /28 peering range for the control plane. Must not overlap the VPC or any peer; 172.16.0.0/28
+# is safe against the default network's 10.x ranges. Change if a peer already uses 172.16.x.
+variable "master_ipv4_cidr_block" {
+  type    = string
+  default = "172.16.0.0/28"
 }
 
 provider "google" {
@@ -41,6 +55,23 @@ resource "google_container_cluster" "this" {
   remove_default_node_pool = true
   initial_node_count       = 1
   deletion_protection      = false # POC — lets you `tofu destroy` cleanly
+
+  # VPC-native (alias IPs) — required for private clusters. Empty block lets GKE
+  # auto-allocate the pod/service secondary ranges on the default network.
+  ip_allocation_policy {}
+
+  # Private cluster: private nodes (no public IPs) + private endpoint (no public API).
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block  = var.master_ipv4_cidr_block
+
+    # Allow reaching the private endpoint from other regions in the VPC (in case
+    # Devtron/poc-2 sits in a different region than this plane).
+    master_global_access_config {
+      enabled = true
+    }
+  }
 
   master_authorized_networks_config {
     dynamic "cidr_blocks" {
@@ -62,6 +93,22 @@ resource "google_container_node_pool" "default" {
     disk_type    = "pd-balanced"
     oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
   }
+}
+
+# ---------- Cloud NAT — egress for private nodes (no public IPs) ----------
+# Without this, nodes can't pull images or let Flux fetch charts from public repos.
+resource "google_compute_router" "this" {
+  name    = "${var.name}-router"
+  region  = var.region
+  network = "default"
+}
+
+resource "google_compute_router_nat" "this" {
+  name                               = "${var.name}-nat"
+  router                             = google_compute_router.this.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
 }
 
 # ---------- providers pointed at the new cluster ----------
@@ -122,7 +169,7 @@ resource "helm_release" "flux" {
   namespace        = "flux-system"
   create_namespace = true
   timeout          = 600
-  depends_on       = [google_container_node_pool.default]
+  depends_on       = [google_container_node_pool.default, google_compute_router_nat.this]
 }
 
 resource "helm_release" "flagger" {
